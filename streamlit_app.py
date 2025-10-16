@@ -131,18 +131,32 @@ def get_comparison_columns(period_key: str, mode: str) -> Dict[str, str]:
 
 
 def z_to_color(z: float | None) -> List[int]:
-    if z is None or math.isnan(z):
-        return [128, 128, 128, 190]
-    scale = max(min(z, 3), -3) / 3
-    if scale >= 0:
-        r = int(255 * scale)
-        g = int(180 * (1 - scale))
-        b = 60
+    if z is None or pd.isna(z):
+        return [160, 160, 160, 210]
+    capped = max(min(float(z), 3.0), -3.0)
+    if abs(capped) < 1.0:
+        return [160, 160, 160, 210]
+    if capped >= 1.0:
+        intensity = min((capped - 1.0) / 2.0, 1.0)
+        r = int(210 + 35 * intensity)
+        g = int(130 * (1 - intensity))
+        b = 70
     else:
-        b = int(255 * abs(scale))
-        g = int(180 * (1 - abs(scale)))
-        r = 60
-    return [r, g, b, 210]
+        intensity = min((abs(capped) - 1.0) / 2.0, 1.0)
+        r = 70
+        g = int(150 * (1 - intensity))
+        b = int(210 + 35 * intensity)
+    return [r, g, b, 220]
+
+
+def risk_to_color(risk: str | None) -> List[int]:
+    palette = {
+        "Critical": [220, 72, 65, 230],
+        "Elevated": [244, 153, 74, 225],
+        "Improving": [60, 120, 255, 225],
+        "Stable": [128, 128, 128, 200],
+    }
+    return palette.get(risk or "Stable", [128, 128, 128, 200])
 
 
 def rate_signal(z: float | None, p_value: float | None) -> str:
@@ -207,6 +221,7 @@ def build_map_layer(
             comp_cols["change"],
             comp_cols["pct_change"],
             comp_cols["poisson_z"],
+            f"{period_key}_poisson_p",
         }
     )
     max_current = layer_data[f"{period_key}_current"].max()
@@ -214,7 +229,14 @@ def build_map_layer(
     layer_data["store_display"] = (
         layer_data["store_name"].fillna("").replace({"": np.nan}).combine_first(layer_data["store_id"])
     )
-    layer_data["color"] = layer_data[f"{period_key}_z_score"].apply(z_to_color)
+    z_col = f"{period_key}_z_score"
+    p_col = f"{period_key}_poisson_p"
+    layer_data["risk_level"] = layer_data.apply(
+        lambda row: rate_signal(row.get(z_col), row.get(p_col)),
+        axis=1,
+    )
+    layer_data["fill_color"] = layer_data[z_col].apply(z_to_color)
+    layer_data["line_color"] = layer_data["risk_level"].apply(risk_to_color)
     if pd.isna(max_current) or max_current <= 0:
         layer_data["radius"] = 60.0
     else:
@@ -239,6 +261,11 @@ def build_map_layer(
             return "n/a"
         return f"{value:+.2f}"
 
+    def _fmt_p(value: float | None) -> str:
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{value:.3f}"
+
     layer_data["current_display"] = (
         layer_data[f"{period_key}_current"].fillna(0).map("{:.0f}".format)
     )
@@ -253,6 +280,7 @@ def build_map_layer(
     layer_data["poisson_z_display"] = layer_data[comp_cols["poisson_z"]].apply(_fmt_poisson_z)
     layer_data["z_score_display"] = layer_data[f"{period_key}_z_score"].apply(_fmt_z)
     layer_data["comparison_label"] = baseline_label
+    layer_data["poisson_p_display"] = layer_data[p_col].apply(_fmt_p)
 
     def _sanitize(record: Dict[str, object]) -> Dict[str, object]:
         cleaned: Dict[str, object] = {}
@@ -294,7 +322,7 @@ def build_map_layer(
         "ScatterplotLayer",
         data=records,
         get_position=["longitude", "latitude"],
-        get_fill_color="color",
+        get_fill_color="fill_color",
         get_radius="radius",
         radius_scale=1,
         radius_min_pixels=24,
@@ -302,8 +330,8 @@ def build_map_layer(
         pickable=True,
         elevation_scale=2,
         stroked=True,
-        get_line_color=[255, 255, 255, 200],
-        line_width_min_pixels=1,
+        get_line_color="line_color",
+        line_width_min_pixels=2,
     )
 
     tooltip = {
@@ -313,7 +341,9 @@ def build_map_layer(
         "Current incidents: {current_display}<br/>"
         "Baseline ({comparison_label}): {baseline_display}<br/>"
         "Δ vs baseline: {delta_badge}<br/>"
+        "Risk level (outline): {risk_level}<br/>"
         "Poisson Z: {poisson_z_display}<br/>"
+        "Poisson p-value: {poisson_p_display}<br/>"
         "Baseline z-score: {z_score_display}",
         "style": {"backgroundColor": "rgba(15,17,22,0.85)", "color": "white"},
     }
@@ -647,20 +677,46 @@ def main():
             legend_html = """
             <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;">
               <div style="display:flex;align-items:center;gap:6px;">
-                <span style="width:14px;height:14px;background:rgba(220,72,65,0.85);display:inline-block;border-radius:3px;"></span>
-                <span style="font-size:0.85rem;">High risk: z >= 2 or Poisson spike</span>
+                <span style="width:18px;height:14px;background:rgb(227,65,70);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Surging: z ≥ 2</span>
               </div>
               <div style="display:flex;align-items:center;gap:6px;">
-                <span style="width:14px;height:14px;background:rgba(128,128,128,0.85);display:inline-block;border-radius:3px;"></span>
-                <span style="font-size:0.85rem;">Stable: |z| < 1 and no spike signal</span>
+                <span style="width:18px;height:14px;background:rgb(218,97,70);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Rising: 1 ≤ z &lt; 2</span>
               </div>
               <div style="display:flex;align-items:center;gap:6px;">
-                <span style="width:14px;height:14px;background:rgba(60,120,255,0.85);display:inline-block;border-radius:3px;"></span>
-                <span style="font-size:0.85rem;">Improving: z <= -2</span>
+                <span style="width:18px;height:14px;background:rgb(160,160,160);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Near baseline: |z| &lt; 1</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:18px;height:14px;background:rgb(70,112,218);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Cooling: -2 &lt; z ≤ -1</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:18px;height:14px;background:rgb(70,75,227);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Improving: z ≤ -2</span>
+              </div>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;">
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:16px;height:16px;border-radius:50%;background:white;border:3px solid rgb(220,72,65);display:inline-block;"></span>
+                <span style="font-size:0.85rem;">Outline: Poisson p &lt; 0.01 (Critical)</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:16px;height:16px;border-radius:50%;background:white;border:3px solid rgb(244,153,74);display:inline-block;"></span>
+                <span style="font-size:0.85rem;">Outline: Poisson p &lt; 0.05 or z ≥ 2 (Elevated)</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:16px;height:16px;border-radius:50%;background:white;border:3px solid rgb(128,128,128);display:inline-block;"></span>
+                <span style="font-size:0.85rem;">Outline: Stable</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:16px;height:16px;border-radius:50%;background:white;border:3px solid rgb(60,120,255);display:inline-block;"></span>
+                <span style="font-size:0.85rem;">Outline: Improving</span>
               </div>
             </div>
             <div style="margin-top:6px;font-size:0.8rem;color:#7f8a9c;">
-              Circle radius scales with current incidents; hover for window totals, change vs baseline, Poisson z, anomaly z-score, and the metrics used in the risk grade.
+              Fill color mirrors the anomaly z-score; circle radius scales with current incidents; hover for totals, baselines, Poisson stats, and the risk grade.
             </div>
             """
             st.markdown(legend_html, unsafe_allow_html=True)
