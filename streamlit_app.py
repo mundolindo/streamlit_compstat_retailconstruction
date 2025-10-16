@@ -76,6 +76,12 @@ def get_reference_date(offenses: pd.DataFrame) -> date:
 
 
 def format_delta(change: float, pct: float) -> str:
+    if change is None or pct is None:
+        return "n/a"
+    if isinstance(change, (float, int)) and pd.isna(change):
+        return "n/a"
+    if isinstance(pct, (float, int)) and pd.isna(pct):
+        return "n/a"
     arrow = "▲" if change > 0 else "▼" if change < 0 else "■"
     return f"{arrow} {change:.0f} ({pct:.1f}%)"
 
@@ -160,15 +166,19 @@ def risk_to_color(risk: str | None) -> List[int]:
 
 
 def rate_signal(z: float | None, p_value: float | None) -> str:
-    if z is None:
+    if z is None or (isinstance(z, float) and math.isnan(z)):
         return "Stable"
     if p_value is not None and p_value < 0.01:
         return "Critical"
+    if z is not None and z >= 2:
+        return "Critical"
     if p_value is not None and p_value < 0.05:
         return "Elevated"
-    if z >= 2:
+    if z is not None and z >= 1:
         return "Elevated"
-    if z <= -2:
+    if z is not None and z <= -2:
+        return "Improving"
+    if z is not None and z <= -1:
         return "Improving"
     return "Stable"
 
@@ -266,12 +276,13 @@ def build_map_layer(
             return "n/a"
         return f"{value:.3f}"
 
-    layer_data["current_display"] = (
-        layer_data[f"{period_key}_current"].fillna(0).map("{:.0f}".format)
-    )
-    layer_data["baseline_display"] = (
-        layer_data[comp_cols["baseline"]].fillna(0).map("{:.0f}".format)
-    )
+    def _fmt_count(value: float | None) -> str:
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{value:.0f}"
+
+    layer_data["current_display"] = layer_data[f"{period_key}_current"].apply(_fmt_count)
+    layer_data["baseline_display"] = layer_data[comp_cols["baseline"]].apply(_fmt_count)
     layer_data["change_display"] = layer_data[comp_cols["change"]].apply(_fmt_delta)
     layer_data["delta_badge"] = layer_data.apply(
         lambda row: format_delta(row[comp_cols["change"]], row[comp_cols["pct_change"]]),
