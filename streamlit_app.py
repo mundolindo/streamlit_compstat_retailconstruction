@@ -80,6 +80,24 @@ def format_delta(change: float, pct: float) -> str:
     return f"{arrow} {change:.0f} ({pct:.1f}%)"
 
 
+def render_poisson_signal(value: float | None) -> str:
+    if value is None or pd.isna(value):
+        return "⚪ n/a"
+    if value >= 3:
+        return "🔴 Critical (≥3)"
+    if value >= 2:
+        return "🟠 Spike (≥2)"
+    if value >= 1:
+        return "🟡 Elevated (≥1)"
+    if value <= -3:
+        return "🟢 Strong improvement (≤-3)"
+    if value <= -2:
+        return "🟢 Improving (≤-2)"
+    if value <= -1:
+        return "🔵 Cooling (≤-1)"
+    return "⚪ Stable"
+
+
 COMPARISON_LABELS = {
     "prior_period": "Prior period",
     "prior_year": "Prior year",
@@ -335,7 +353,7 @@ def render_kpis(metrics: pd.DataFrame, comparison_mode: str) -> None:
                 f"Daily avg {summary['daily_mean']:.2f} (Δ {summary['daily_change']:+.2f})"
             )
             st.markdown(
-                f"**Risk:** {summary['risk_level']} (z̄ {summary['z_score']:.2f})"
+                f"**Risk:** {summary['risk_level']} (avg z-score {summary['z_score']:.2f}; Poisson spike test applied)"
             )
 
 
@@ -424,6 +442,24 @@ def build_metrics_table(
     available_cols = [col for col in display_cols if col in metrics.columns]
     table = metrics[available_cols + optional_cols].copy()
 
+    signal_col = comp_cols["poisson_z"]
+    if signal_col in table.columns:
+        table["Poisson Signal"] = table[signal_col].apply(render_poisson_signal)
+
+    ordered_cols: List[str] = []
+    for col in display_cols:
+        if col in table.columns:
+            ordered_cols.append(col)
+            if col == signal_col and "Poisson Signal" in table.columns:
+                ordered_cols.append("Poisson Signal")
+    for col in optional_cols:
+        if col in table.columns:
+            ordered_cols.append(col)
+    for col in table.columns:
+        if col not in ordered_cols:
+            ordered_cols.append(col)
+    table = table[ordered_cols]
+
     rename_map = {
         "brand": "Brand",
         "city": "City",
@@ -433,6 +469,7 @@ def build_metrics_table(
         comp_cols["pct_change"]: "%Δ",
         comp_cols["poisson_z"]: "Poisson Z",
         "street_address": "Street Address",
+        "Poisson Signal": "Poisson Signal",
     }
     rename_map = {k: v for k, v in rename_map.items() if k in table.columns}
     table = table.rename(columns=rename_map)
@@ -589,6 +626,9 @@ def main():
         )
 
         st.markdown("### Multi-Window Snapshot")
+        st.caption(
+            "Tiles stack 7-day, 28-day, and year-to-date incident counts alongside the chosen baseline to highlight shifts and the underlying risk grade."
+        )
         render_kpis(metrics, comparison_mode)
 
         map_col, list_col = st.columns([3, 1])
@@ -608,19 +648,19 @@ def main():
             <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;">
               <div style="display:flex;align-items:center;gap:6px;">
                 <span style="width:14px;height:14px;background:rgba(220,72,65,0.85);display:inline-block;border-radius:3px;"></span>
-                <span style="font-size:0.85rem;">Elevated spike (z ≥ 2)</span>
+                <span style="font-size:0.85rem;">High risk: z >= 2 or Poisson spike</span>
               </div>
               <div style="display:flex;align-items:center;gap:6px;">
                 <span style="width:14px;height:14px;background:rgba(128,128,128,0.85);display:inline-block;border-radius:3px;"></span>
-                <span style="font-size:0.85rem;">Stable trend</span>
+                <span style="font-size:0.85rem;">Stable: |z| < 1 and no spike signal</span>
               </div>
               <div style="display:flex;align-items:center;gap:6px;">
                 <span style="width:14px;height:14px;background:rgba(60,120,255,0.85);display:inline-block;border-radius:3px;"></span>
-                <span style="font-size:0.85rem;">Improving (z ≤ -2)</span>
+                <span style="font-size:0.85rem;">Improving: z <= -2</span>
               </div>
             </div>
             <div style="margin-top:6px;font-size:0.8rem;color:#7f8a9c;">
-              Circle size scales with current-period incident volume; outline highlights clickable locations.
+              Circle radius scales with current incidents; hover for window totals, change vs baseline, Poisson z, anomaly z-score, and the metrics used in the risk grade.
             </div>
             """
             st.markdown(legend_html, unsafe_allow_html=True)
@@ -644,6 +684,7 @@ def main():
                         "Δ": st.column_config.NumberColumn(format="%.0f"),
                         "%Δ": st.column_config.NumberColumn(format="%.1f%%"),
                         "Poisson Z": st.column_config.NumberColumn(format="%.2f"),
+                        "Poisson Signal": st.column_config.TextColumn(width="medium"),
                     },
                     use_container_width=True,
                     hide_index=True,
@@ -728,12 +769,11 @@ def main():
 
         with st.expander("Data Quality & Methodology"):
             st.markdown(
-                "- **Source refresh:** `scripts/fetch_data.py` pulls OpenStreetMap store "
-                "geometry and Dallas NIBRS incidents (rolling 2024–present).\n"
-                "- **CompStat windows:** 7-day and 28-day compare against the preceding "
-                "matching duration; YTD compares to the same span from the prior calendar year.\n"
-                "- **Anomaly scoring:** z-scores derived from store-specific daily baselines; "
-                "Poisson survival probabilities < 0.05 highlight statistically rare spikes."
+                "- **Multi-window snapshot:** KPI tiles stack 7-day, 28-day, and year-to-date totals against the selected baseline (prior period or prior year) so directional shifts surface immediately.\n"
+                "- **Risk grading:** Store risk labels blend the average anomaly z-score with the strongest Poisson spike test; the same rubric powers the Risk readout in the snapshot and summary tables.\n"
+                "- **Source refresh:** `scripts/fetch_data.py` pulls OpenStreetMap store geometry and Dallas NIBRS incidents (rolling 2024-present).\n"
+                "- **CompStat windows:** 7-day and 28-day measures compare against the preceding matching duration; year-to-date compares to the same span from the prior calendar year.\n"
+                "- **Anomaly scoring:** Z-scores come from store-specific daily baselines, while Poisson survival probabilities below 0.05 flag statistically rare spikes."
             )
 
     with viz_tab:
