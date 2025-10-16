@@ -78,6 +78,7 @@ def _build_daily_matrix(
 def _expand_daily_counts(
     daily_counts: pd.DataFrame,
     reference_date: date,
+    store_ids: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     min_date = daily_counts["occurred_day"].min()
     if pd.isna(min_date):
@@ -86,7 +87,10 @@ def _expand_daily_counts(
     min_date = pd.to_datetime(min_date).date()
     all_dates = pd.date_range(start=min_date, end=reference_date, freq="D")
 
-    store_ids = daily_counts["store_id"].unique()
+    if store_ids is None:
+        store_ids = daily_counts["store_id"].unique()
+    else:
+        store_ids = pd.Index(store_ids).unique()
     full_index = pd.MultiIndex.from_product(
         [store_ids, all_dates.date], names=["store_id", "occurred_day"]
     )
@@ -171,6 +175,7 @@ def _calc_poisson_p(
 def compute_compstat_summary(
     offenses_df: pd.DataFrame,
     reference_date: date | None = None,
+    stores_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Compute CompStat metrics for each store.
@@ -182,12 +187,17 @@ def compute_compstat_summary(
 
     ref_date = _ensure_reference_date(offenses_df, reference_date)
     daily_counts, store_meta = _build_daily_matrix(offenses_df)
-    expanded_daily = _expand_daily_counts(daily_counts, ref_date)
+    observed_store_ids = pd.Index(daily_counts["store_id"].unique())
+    if stores_df is not None and "store_id" in stores_df.columns:
+        provided_ids = pd.Index(stores_df["store_id"].astype(str).unique())
+        store_ids = observed_store_ids.union(provided_ids)
+    else:
+        store_ids = observed_store_ids
+
+    expanded_daily = _expand_daily_counts(daily_counts, ref_date, store_ids=store_ids)
     mean_daily, std_daily = _compute_baselines(expanded_daily)
 
     metrics_rows: list[Dict] = []
-    store_ids = expanded_daily["store_id"].unique()
-
     for store_id in store_ids:
         row: Dict[str, object] = {"store_id": store_id}
         if store_id in store_meta.index:
@@ -222,6 +232,7 @@ def compute_compstat_summary(
 
             z_score = _calc_z_score(current_value, mean_val, std_val, period_days)
             poisson_p = _calc_poisson_p(current_value, mean_val, period_days)
+            poisson_z = 2 * (math.sqrt(current_value) - math.sqrt(previous_value))
 
             row[f"{period.key}_current"] = current_value
             row[f"{period.key}_previous"] = previous_value
@@ -229,6 +240,7 @@ def compute_compstat_summary(
             row[f"{period.key}_pct_change"] = pct_change
             row[f"{period.key}_z_score"] = z_score
             row[f"{period.key}_poisson_p"] = poisson_p
+            row[f"{period.key}_poisson_z"] = poisson_z
             row[f"{period.key}_window"] = (
                 f"{curr_start.isoformat()} – {curr_end.isoformat()}"
             )

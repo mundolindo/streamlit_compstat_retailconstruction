@@ -105,24 +105,111 @@ def derive_action_items(row: pd.Series, period_key: str) -> List[str]:
 
 def build_map_layer(metrics: pd.DataFrame, period_key: str) -> pdk.Deck:
     layer_data = metrics.dropna(subset=["latitude", "longitude"]).copy()
+    keep_cols = [
+        "longitude",
+        "latitude",
+        "brand",
+        "city",
+        "store_name",
+        f"{period_key}_current",
+        f"{period_key}_change",
+        f"{period_key}_z_score",
+        f"{period_key}_poisson_z",
+    ]
+    max_current = layer_data[f"{period_key}_current"].max()
+    layer_data = layer_data[keep_cols]
     layer_data["color"] = layer_data[f"{period_key}_z_score"].apply(z_to_color)
+    if pd.isna(max_current) or max_current <= 0:
+        layer_data["radius"] = 60.0
+    else:
+        layer_data["radius"] = (
+            layer_data[f"{period_key}_current"]
+            .clip(lower=0)
+            .apply(lambda val: 30.0 + (math.sqrt(val / max_current) * 140.0))
+        )
+
+    def _fmt_delta(change: float | None) -> str:
+        if change is None or pd.isna(change):
+            return "n/a"
+        return f"{change:+.0f}"
+
+    def _fmt_poisson_z(value: float | None) -> str:
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{value:+.2f}"
+
+    def _fmt_z(value: float | None) -> str:
+        if value is None or pd.isna(value):
+            return "n/a"
+        return f"{value:+.2f}"
+
+    layer_data["current_display"] = layer_data[f"{period_key}_current"].fillna(0).map("{:.0f}".format)
+    layer_data["change_display"] = layer_data[f"{period_key}_change"].apply(_fmt_delta)
+    layer_data["poisson_z_display"] = layer_data[f"{period_key}_poisson_z"].apply(_fmt_poisson_z)
+    layer_data["z_score_display"] = layer_data[f"{period_key}_z_score"].apply(_fmt_z)
+
+    def _sanitize(record: Dict[str, object]) -> Dict[str, object]:
+        cleaned: Dict[str, object] = {}
+        for key, value in record.items():
+            if isinstance(value, pd.Timestamp):
+                value = value.isoformat()
+            elif isinstance(value, pd.Series):
+                value = value.squeeze().tolist()
+            elif isinstance(value, (np.generic,)):
+                value = value.item()
+            elif isinstance(value, (list, tuple, dict)):
+                cleaned[key] = value
+                continue
+            try:
+                if pd.isna(value):
+                    cleaned[key] = None
+                    continue
+            except Exception:
+                pass
+            cleaned[key] = value
+        return cleaned
+
+    def _coerce_float(value: object, fallback: float = 0.0) -> float:
+        try:
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                return fallback
+            return float(value)
+        except Exception:
+            return fallback
+
+    records = []
+    for rec in layer_data.to_dict(orient="records"):
+        enriched = {**rec}
+        enriched["radius"] = _coerce_float(rec.get("radius"), 60.0)
+        enriched[f"{period_key}_poisson_z"] = _coerce_float(
+            rec.get(f"{period_key}_poisson_z"), 0.0
+        )
+        records.append(_sanitize(enriched))
 
     scatter = pdk.Layer(
         "ScatterplotLayer",
-        data=layer_data,
+        data=records,
         get_position=["longitude", "latitude"],
         get_fill_color="color",
-        get_radius=150,
+        get_radius="radius",
+        radius_scale=1,
+        radius_min_pixels=24,
+        radius_max_pixels=140,
         pickable=True,
         elevation_scale=2,
+        stroked=True,
+        get_line_color=[255, 255, 255, 200],
+        line_width_min_pixels=1,
     )
 
     tooltip = {
         "html": "<b>{store_name}</b><br/>"
         "Brand: {brand}<br/>"
         "City: {city}<br/>"
-        f"Current incidents: {{{period_key}_current}}<br/>"
-        f"Δ vs prior: {{{period_key}_change}}",
+        "Current incidents: {current_display}<br/>"
+        "Δ vs prior: {change_display}<br/>"
+        "Poisson Z: {poisson_z_display}<br/>"
+        "Baseline z-score: {z_score_display}",
         "style": {"backgroundColor": "rgba(15,17,22,0.85)", "color": "white"},
     }
 
@@ -135,7 +222,12 @@ def build_map_layer(metrics: pd.DataFrame, period_key: str) -> pdk.Deck:
         pitch=30,
     )
 
-    return pdk.Deck(layers=[scatter], initial_view_state=view_state, tooltip=tooltip)
+    return pdk.Deck(
+        layers=[scatter],
+        initial_view_state=view_state,
+        tooltip=tooltip,
+        height=360,
+    )
 
 
 def render_kpis(aggregated: Dict[str, float], period: PeriodDefinition) -> None:
@@ -220,27 +312,28 @@ def build_metrics_table(
         f"{period_key}_previous",
         f"{period_key}_change",
         f"{period_key}_pct_change",
-        f"{period_key}_z_score",
-        f"{period_key}_poisson_p",
+        f"{period_key}_poisson_z",
     ]
-    table = metrics.merge(
-        stores[["store_id", "latitude", "longitude", "street_address"]],
-        on="store_id",
-        how="left",
-    )[display_cols + ["street_address"]]
+    optional_cols = []
+    for candidate in ["street_address"]:
+        if candidate in metrics.columns:
+            optional_cols.append(candidate)
 
-    table = table.rename(
-        columns={
-            "brand": "Brand",
-            "city": "City",
-            f"{period_key}_current": "Current",
-            f"{period_key}_previous": "Previous",
-            f"{period_key}_change": "Δ",
-            f"{period_key}_pct_change": "%Δ",
-            f"{period_key}_z_score": "Z-Score",
-            f"{period_key}_poisson_p": "Poisson p",
-        }
-    )
+    available_cols = [col for col in display_cols if col in metrics.columns]
+    table = metrics[available_cols + optional_cols].copy()
+
+    rename_map = {
+        "brand": "Brand",
+        "city": "City",
+        f"{period_key}_current": "Current",
+        f"{period_key}_previous": "Previous",
+        f"{period_key}_change": "Δ",
+        f"{period_key}_pct_change": "%Δ",
+        f"{period_key}_poisson_z": "Poisson Z",
+        "street_address": "Street Address",
+    }
+    rename_map = {k: v for k, v in rename_map.items() if k in table.columns}
+    table = table.rename(columns=rename_map)
     return table
 
 
@@ -365,117 +458,268 @@ def main():
         st.warning("No offenses match the selected filters. Adjust the controls to view data.")
         return
 
-    metrics = compute_compstat_summary(filtered_offenses, reference_date)
+    filtered_views = build_time_series_views(filtered_offenses)
+    metrics = compute_compstat_summary(filtered_offenses, reference_date, stores)
+    store_merge_cols = ["store_id"]
+    for candidate in ["brand", "city", "latitude", "longitude", "street_address"]:
+        if candidate in stores.columns:
+            store_merge_cols.append(candidate)
     metrics = metrics.merge(
-        stores[["store_id", "brand", "city", "latitude", "longitude", "street_address"]],
+        stores[store_merge_cols],
         on="store_id",
         how="left",
     )
+    if "brand" not in metrics.columns and "store_brand" in metrics.columns:
+        metrics["brand"] = metrics["store_brand"]
+    if "city" not in metrics.columns and "store_city" in metrics.columns:
+        metrics["city"] = metrics["store_city"]
+    if "street_address" not in metrics.columns:
+        metrics["street_address"] = ""
     metrics = metrics.sort_values(f"{period_key}_z_score", ascending=False)
 
-    st.title("Dallas Home Improvement CompStat")
-    st.subheader(
-        "Operational intelligence for Home Depot and Lowe's locations "
-        "across Dallas–Fort Worth."
+    overview_tab, viz_tab = st.tabs(
+        ["Executive Overview", "Store Visualizations"]
     )
 
-    aggregate = aggregate_period(metrics, period_key)
-    render_kpis(aggregate, next(p for p in PERIODS if p.key == period_key))
+    with overview_tab:
+        st.title("Dallas Home Improvement CompStat")
+        st.subheader(
+            "Operational intelligence for Home Depot and Lowe's locations "
+            "across Dallas–Fort Worth."
+        )
 
-    map_deck = build_map_layer(metrics, period_key)
-    st.pydeck_chart(map_deck, use_container_width=True)
+        aggregate = aggregate_period(metrics, period_key)
+        render_kpis(aggregate, next(p for p in PERIODS if p.key == period_key))
 
-    st.markdown("### Store CompStat Table")
-    table = build_metrics_table(metrics, stores, period_key)
-    st.dataframe(
-        table,
-        column_config={
-            "Current": st.column_config.NumberColumn(format="%.0f"),
-            "Previous": st.column_config.NumberColumn(format="%.0f"),
-            "Δ": st.column_config.NumberColumn(format="%.0f"),
-            "%Δ": st.column_config.NumberColumn(format="%.1f%%"),
-            "Z-Score": st.column_config.NumberColumn(format="%.2f"),
-            "Poisson p": st.column_config.NumberColumn(format="%.3f"),
-        },
-        use_container_width=True,
-        hide_index=True,
-    )
+        map_deck = build_map_layer(metrics, period_key)
+        map_col, list_col = st.columns([3, 1])
+        with map_col:
+            st.pydeck_chart(map_deck, use_container_width=True)
+            legend_html = """
+            <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;">
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:14px;height:14px;background:rgba(220,72,65,0.85);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Elevated spike (z ≥ 2)</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:14px;height:14px;background:rgba(128,128,128,0.85);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Stable trend</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span style="width:14px;height:14px;background:rgba(60,120,255,0.85);display:inline-block;border-radius:3px;"></span>
+                <span style="font-size:0.85rem;">Improving (z ≤ -2)</span>
+              </div>
+            </div>
+            <div style="margin-top:6px;font-size:0.8rem;color:#7f8a9c;">
+              Circle size scales with current-period incident volume; outline highlights clickable locations.
+            </div>
+            """
+            st.markdown(legend_html, unsafe_allow_html=True)
+            st.caption(
+                "Tip: hover a store to see current incidents, change vs prior window, the Wheeler Poisson Z-score, and the baseline anomaly z-score."
+            )
+        with list_col:
+            st.markdown("#### Priority Stores")
+            priority = (
+                metrics.dropna(subset=[f"{period_key}_z_score"])
+                .sort_values(f"{period_key}_z_score", ascending=False)
+                .head(5)
+            )
+            if priority.empty:
+                st.caption("No positive anomalies for the selected filters.")
+            else:
+                for _, row in priority.iterrows():
+                    label = row["store_id"]
+                    st.metric(
+                        label,
+                        f"{row[f'{period_key}_current']:.0f}",
+                        format_delta(
+                            row[f"{period_key}_change"],
+                            row[f"{period_key}_pct_change"],
+                        ),
+                    )
 
-    store_labels = (
-        metrics["store_id"].astype(str)
-        + " • "
-        + metrics["brand"].astype(str)
-        + " ("
-        + metrics["city"].astype(str)
-        + ")"
-    )
-    store_lookup = dict(zip(store_labels, metrics["store_id"]))
-
-    st.markdown("### Deep Dive")
-    selected_store_label = st.selectbox(
-        "Select a store for tactical review",
-        options=list(store_lookup.keys()),
-    )
-    selected_store_id = store_lookup[selected_store_label]
-    selected_row = metrics[metrics["store_id"] == selected_store_id].iloc[0]
-
-    cols = st.columns(3)
-    cols[0].metric(
-        "Current incidents",
-        f"{selected_row[f'{period_key}_current']:.0f}",
-        format_delta(
-            selected_row[f"{period_key}_change"],
-            selected_row[f"{period_key}_pct_change"],
-        ),
-    )
-    z_val = selected_row.get(f"{period_key}_z_score") or 0
-    cols[1].metric("Z-Score", f"{z_val:.2f}")
-    p_val = selected_row.get(f"{period_key}_poisson_p") or 1
-    cols[2].metric("Poisson Trigger", f"{p_val:.3f}")
-
-    charts_col1, charts_col2 = st.columns(2)
-    with charts_col1:
-        st.plotly_chart(
-            plot_weekly_trend(data["weekly_counts"], selected_store_id),
+        st.markdown("### Store CompStat Table")
+        table = build_metrics_table(metrics, stores, period_key)
+        st.dataframe(
+            table,
+            column_config={
+                "Current": st.column_config.NumberColumn(format="%.0f"),
+                "Previous": st.column_config.NumberColumn(format="%.0f"),
+                "Δ": st.column_config.NumberColumn(format="%.0f"),
+                "%Δ": st.column_config.NumberColumn(format="%.1f%%"),
+                "Poisson Z": st.column_config.NumberColumn(format="%.2f"),
+            },
             use_container_width=True,
-        )
-        st.plotly_chart(
-            plot_category_distribution(data["offense_categories"], selected_store_id),
-            use_container_width=True,
-        )
-    with charts_col2:
-        st.plotly_chart(
-            plot_heatmap(data["hourly_pattern"], selected_store_id),
-            use_container_width=True,
+            hide_index=True,
         )
 
-    st.markdown("#### Tactical Notes")
-    for note in derive_action_items(selected_row, period_key):
-        st.write(f"- {note}")
-
-    st.markdown("#### Strategic Considerations")
-    st.write(
-        "- Contrast store performance with same-brand peers to identify "
-        "enterprise-level vulnerabilities."
-    )
-    st.write(
-        "- Leverage directed patrols, safety audits, and CCTV intelligence "
-        "within active anomalies to validate mitigation."
-    )
-    st.write(
-        "- Coordinate cross-functional reviews (loss prevention, property "
-        "management, DPD) for sustained trend lines."
-    )
-
-    with st.expander("Data Quality & Methodology"):
-        st.markdown(
-            "- **Source refresh:** `scripts/fetch_data.py` pulls OpenStreetMap store "
-            "geometry and Dallas NIBRS incidents (rolling 2024–present).\n"
-            "- **CompStat windows:** 7-day and 28-day compare against the preceding "
-            "matching duration; YTD compares to the same span from the prior calendar year.\n"
-            "- **Anomaly scoring:** z-scores derived from store-specific daily baselines; "
-            "Poisson survival probabilities < 0.05 highlight statistically rare spikes."
+        store_labels = (
+            metrics["store_id"].astype(str)
+            + " • "
+            + metrics["brand"].astype(str)
+            + " ("
+            + metrics["city"].astype(str)
+            + ")"
         )
+        store_lookup = dict(zip(store_labels, metrics["store_id"]))
+
+        st.markdown("### Deep Dive")
+        selected_store_label = st.selectbox(
+            "Select a store for tactical review",
+            options=list(store_lookup.keys()),
+        )
+        selected_store_id = store_lookup[selected_store_label]
+        selected_row = metrics[metrics["store_id"] == selected_store_id].iloc[0]
+
+        cols = st.columns(3)
+        cols[0].metric(
+            "Current incidents",
+            f"{selected_row[f'{period_key}_current']:.0f}",
+            format_delta(
+                selected_row[f"{period_key}_change"],
+                selected_row[f"{period_key}_pct_change"],
+            ),
+        )
+        z_val = selected_row.get(f"{period_key}_z_score") or 0
+        cols[1].metric("Z-Score", f"{z_val:.2f}")
+        p_val = selected_row.get(f"{period_key}_poisson_p") or 1
+        cols[2].metric("Poisson Trigger", f"{p_val:.3f}")
+
+        charts_col1, charts_col2 = st.columns(2)
+        with charts_col1:
+            st.plotly_chart(
+                plot_weekly_trend(filtered_views["weekly_counts"], selected_store_id),
+                use_container_width=True,
+                key=f"deep-dive-weekly-{selected_store_id}",
+            )
+            st.plotly_chart(
+                plot_category_distribution(
+                    filtered_views["offense_categories"], selected_store_id
+                ),
+                use_container_width=True,
+                key=f"deep-dive-category-{selected_store_id}",
+            )
+        with charts_col2:
+            st.plotly_chart(
+                plot_heatmap(filtered_views["hourly_pattern"], selected_store_id),
+                use_container_width=True,
+                key=f"deep-dive-heatmap-{selected_store_id}",
+            )
+
+        st.markdown("#### Tactical Notes")
+        for note in derive_action_items(selected_row, period_key):
+            st.write(f"- {note}")
+
+        st.markdown("#### Strategic Considerations")
+        st.write(
+            "- Contrast store performance with same-brand peers to identify "
+            "enterprise-level vulnerabilities."
+        )
+        st.write(
+            "- Leverage directed patrols, safety audits, and CCTV intelligence "
+            "within active anomalies to validate mitigation."
+        )
+        st.write(
+            "- Coordinate cross-functional reviews (loss prevention, property "
+            "management, DPD) for sustained trend lines."
+        )
+
+        with st.expander("Data Quality & Methodology"):
+            st.markdown(
+                "- **Source refresh:** `scripts/fetch_data.py` pulls OpenStreetMap store "
+                "geometry and Dallas NIBRS incidents (rolling 2024–present).\n"
+                "- **CompStat windows:** 7-day and 28-day compare against the preceding "
+                "matching duration; YTD compares to the same span from the prior calendar year.\n"
+                "- **Anomaly scoring:** z-scores derived from store-specific daily baselines; "
+                "Poisson survival probabilities < 0.05 highlight statistically rare spikes."
+            )
+
+    with viz_tab:
+        st.header("Store-Level Visual Analytics")
+        st.caption(
+            "Compare each Dallas-area Home Depot and Lowe's location using synchronized trend, "
+            "category, and day/hour visuals."
+        )
+
+        store_display = (
+            metrics["store_id"].astype(str)
+            + " – "
+            + metrics["store_name"].fillna(metrics["brand"])
+            + " ("
+            + metrics["city"].astype(str)
+            + ")"
+        )
+        viz_options = dict(zip(store_display, metrics["store_id"]))
+
+        default_selection = list(viz_options.keys())[:3]
+        selected_viz_labels = st.multiselect(
+            "Stores to visualize",
+            options=list(viz_options.keys()),
+            default=default_selection,
+        )
+
+        if not selected_viz_labels:
+            st.info("Select one or more stores to load visual comparisons.")
+        else:
+            for label in selected_viz_labels:
+                store_id = viz_options[label]
+                store_row = metrics[metrics["store_id"] == store_id].iloc[0]
+                st.markdown(f"### {label}")
+                kpi_cols = st.columns(4)
+                kpi_cols[0].metric(
+                    "7-Day",
+                    f"{store_row['seven_day_current']:.0f}",
+                    format_delta(
+                        store_row["seven_day_change"],
+                        store_row["seven_day_pct_change"],
+                    ),
+                )
+                kpi_cols[1].metric(
+                    "28-Day",
+                    f"{store_row['four_week_current']:.0f}",
+                    format_delta(
+                        store_row["four_week_change"],
+                        store_row["four_week_pct_change"],
+                    ),
+                )
+                kpi_cols[2].metric(
+                    "YTD",
+                    f"{store_row['ytd_current']:.0f}",
+                    format_delta(
+                        store_row["ytd_change"],
+                        store_row["ytd_pct_change"],
+                    ),
+                )
+                z_score = store_row["seven_day_z_score"]
+                kpi_cols[3].metric(
+                    "7-Day z-score",
+                    f"{(z_score or 0):.2f}",
+                )
+
+                chart_col1, chart_col2 = st.columns(2)
+                with chart_col1:
+                    st.plotly_chart(
+                        plot_weekly_trend(filtered_views["weekly_counts"], store_id),
+                        use_container_width=True,
+                        key=f"compare-weekly-{store_id}",
+                    )
+                with chart_col2:
+                    st.plotly_chart(
+                        plot_category_distribution(
+                            filtered_views["offense_categories"], store_id
+                        ),
+                        use_container_width=True,
+                        key=f"compare-category-{store_id}",
+                    )
+
+                st.plotly_chart(
+                    plot_heatmap(filtered_views["hourly_pattern"], store_id),
+                    use_container_width=True,
+                    key=f"compare-heatmap-{store_id}",
+                )
+
+                st.divider()
 
 
 if __name__ == "__main__":
