@@ -212,16 +212,27 @@ def compute_compstat_summary(
             current_counts = _aggregate_period_counts(
                 expanded_daily, curr_start, curr_end
             )
-            previous_counts = _aggregate_period_counts(
-                expanded_daily, prev_start, prev_end
+            previous_counts = _aggregate_period_counts(expanded_daily, prev_start, prev_end)
+
+            prev_year_start = curr_start - relativedelta(years=1)
+            prev_year_end = curr_end - relativedelta(years=1)
+            prev_year_counts = _aggregate_period_counts(
+                expanded_daily, prev_year_start, prev_year_end
             )
 
             current_value = float(current_counts.get(store_id, 0.0))
             previous_value = float(previous_counts.get(store_id, 0.0))
+            prev_year_value = float(prev_year_counts.get(store_id, 0.0))
             change = current_value - previous_value
             pct_change = (
                 (change / previous_value) * 100
                 if previous_value > 0
+                else (100.0 if current_value > 0 else 0.0)
+            )
+            change_prev_year = current_value - prev_year_value
+            pct_change_prev_year = (
+                (change_prev_year / prev_year_value) * 100
+                if prev_year_value > 0
                 else (100.0 if current_value > 0 else 0.0)
             )
 
@@ -236,13 +247,24 @@ def compute_compstat_summary(
 
             row[f"{period.key}_current"] = current_value
             row[f"{period.key}_previous"] = previous_value
+            row[f"{period.key}_previous_year"] = prev_year_value
             row[f"{period.key}_change"] = change
             row[f"{period.key}_pct_change"] = pct_change
+            row[f"{period.key}_change_prev_year"] = change_prev_year
+            row[f"{period.key}_pct_change_prev_year"] = pct_change_prev_year
             row[f"{period.key}_z_score"] = z_score
             row[f"{period.key}_poisson_p"] = poisson_p
             row[f"{period.key}_poisson_z"] = poisson_z
+            row[f"{period.key}_poisson_z_prev_year"] = (
+                2 * (math.sqrt(current_value) - math.sqrt(prev_year_value))
+                if prev_year_value >= 0
+                else None
+            )
             row[f"{period.key}_window"] = (
                 f"{curr_start.isoformat()} – {curr_end.isoformat()}"
+            )
+            row[f"{period.key}_window_prev_year"] = (
+                f"{prev_year_start.isoformat()} – {prev_year_end.isoformat()}"
             )
 
         metrics_rows.append(row)

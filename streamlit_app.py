@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import textwrap
 from datetime import date
 from typing import Dict, List
 
@@ -37,6 +38,36 @@ def get_data() -> Dict[str, pd.DataFrame]:
     return {"stores": stores, "offenses": offenses, **views}
 
 
+@st.cache_data(show_spinner=False)
+def compute_metrics_frame(
+    filtered_offenses: pd.DataFrame,
+    stores: pd.DataFrame,
+    reference_date: date,
+) -> pd.DataFrame:
+    metrics = compute_compstat_summary(filtered_offenses, reference_date, stores)
+    store_merge_cols = ["store_id"]
+    for candidate in ["brand", "city", "latitude", "longitude", "street_address"]:
+        if candidate in stores.columns:
+            store_merge_cols.append(candidate)
+    metrics = metrics.merge(
+        stores[store_merge_cols],
+        on="store_id",
+        how="left",
+    )
+    if "brand" not in metrics.columns and "store_brand" in metrics.columns:
+        metrics["brand"] = metrics["store_brand"]
+    if "city" not in metrics.columns and "store_city" in metrics.columns:
+        metrics["city"] = metrics["store_city"]
+    if "street_address" not in metrics.columns:
+        metrics["street_address"] = ""
+    return metrics
+
+
+@st.cache_data(show_spinner=False)
+def build_filtered_views_cached(filtered_offenses: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    return build_time_series_views(filtered_offenses)
+
+
 def get_reference_date(offenses: pd.DataFrame) -> date:
     max_date = offenses["occurred_date"].max()
     if isinstance(max_date, pd.Timestamp):
@@ -47,6 +78,38 @@ def get_reference_date(offenses: pd.DataFrame) -> date:
 def format_delta(change: float, pct: float) -> str:
     arrow = "▲" if change > 0 else "▼" if change < 0 else "■"
     return f"{arrow} {change:.0f} ({pct:.1f}%)"
+
+
+COMPARISON_LABELS = {
+    "prior_period": "Prior period",
+    "prior_year": "Prior year",
+}
+
+
+def normalize_comparison_mode(selection: str) -> str:
+    if selection.lower().startswith("prior year"):
+        return "prior_year"
+    return "prior_period"
+
+
+def get_comparison_columns(period_key: str, mode: str) -> Dict[str, str]:
+    if mode == "prior_year":
+        return {
+            "baseline": f"{period_key}_previous_year",
+            "change": f"{period_key}_change_prev_year",
+            "pct_change": f"{period_key}_pct_change_prev_year",
+            "poisson_z": f"{period_key}_poisson_z_prev_year",
+            "window": f"{period_key}_window",
+            "baseline_window": f"{period_key}_window_prev_year",
+        }
+    return {
+        "baseline": f"{period_key}_previous",
+        "change": f"{period_key}_change",
+        "pct_change": f"{period_key}_pct_change",
+        "poisson_z": f"{period_key}_poisson_z",
+        "window": f"{period_key}_window",
+        "baseline_window": f"{period_key}_window",
+    }
 
 
 def z_to_color(z: float | None) -> List[int]:
@@ -78,12 +141,13 @@ def rate_signal(z: float | None, p_value: float | None) -> str:
     return "Stable"
 
 
-def derive_action_items(row: pd.Series, period_key: str) -> List[str]:
+def derive_action_items(row: pd.Series, period_key: str, comparison_mode: str) -> List[str]:
     takeaways: List[str] = []
+    columns = get_comparison_columns(period_key, comparison_mode)
     z = row.get(f"{period_key}_z_score")
     p_val = row.get(f"{period_key}_poisson_p")
-    pct = row.get(f"{period_key}_pct_change")
-    change = row.get(f"{period_key}_change")
+    pct = row.get(columns["pct_change"])
+    change = row.get(columns["change"])
     current = row.get(f"{period_key}_current")
 
     if current is None:
@@ -103,21 +167,35 @@ def derive_action_items(row: pd.Series, period_key: str) -> List[str]:
     return takeaways
 
 
-def build_map_layer(metrics: pd.DataFrame, period_key: str) -> pdk.Deck:
+def build_map_layer(
+    metrics: pd.DataFrame,
+    period_key: str,
+    comparison_mode: str,
+) -> pdk.Deck:
     layer_data = metrics.dropna(subset=["latitude", "longitude"]).copy()
-    keep_cols = [
-        "longitude",
-        "latitude",
-        "brand",
-        "city",
-        "store_name",
-        f"{period_key}_current",
-        f"{period_key}_change",
-        f"{period_key}_z_score",
-        f"{period_key}_poisson_z",
-    ]
+    comp_cols = get_comparison_columns(period_key, comparison_mode)
+    baseline_label = COMPARISON_LABELS.get(comparison_mode, "Prior period")
+    keep_cols = list(
+        {
+            "longitude",
+            "latitude",
+            "store_id",
+            "brand",
+            "city",
+            "store_name",
+            f"{period_key}_current",
+            f"{period_key}_z_score",
+            comp_cols["baseline"],
+            comp_cols["change"],
+            comp_cols["pct_change"],
+            comp_cols["poisson_z"],
+        }
+    )
     max_current = layer_data[f"{period_key}_current"].max()
     layer_data = layer_data[keep_cols]
+    layer_data["store_display"] = (
+        layer_data["store_name"].fillna("").replace({"": np.nan}).combine_first(layer_data["store_id"])
+    )
     layer_data["color"] = layer_data[f"{period_key}_z_score"].apply(z_to_color)
     if pd.isna(max_current) or max_current <= 0:
         layer_data["radius"] = 60.0
@@ -143,10 +221,20 @@ def build_map_layer(metrics: pd.DataFrame, period_key: str) -> pdk.Deck:
             return "n/a"
         return f"{value:+.2f}"
 
-    layer_data["current_display"] = layer_data[f"{period_key}_current"].fillna(0).map("{:.0f}".format)
-    layer_data["change_display"] = layer_data[f"{period_key}_change"].apply(_fmt_delta)
-    layer_data["poisson_z_display"] = layer_data[f"{period_key}_poisson_z"].apply(_fmt_poisson_z)
+    layer_data["current_display"] = (
+        layer_data[f"{period_key}_current"].fillna(0).map("{:.0f}".format)
+    )
+    layer_data["baseline_display"] = (
+        layer_data[comp_cols["baseline"]].fillna(0).map("{:.0f}".format)
+    )
+    layer_data["change_display"] = layer_data[comp_cols["change"]].apply(_fmt_delta)
+    layer_data["delta_badge"] = layer_data.apply(
+        lambda row: format_delta(row[comp_cols["change"]], row[comp_cols["pct_change"]]),
+        axis=1,
+    )
+    layer_data["poisson_z_display"] = layer_data[comp_cols["poisson_z"]].apply(_fmt_poisson_z)
     layer_data["z_score_display"] = layer_data[f"{period_key}_z_score"].apply(_fmt_z)
+    layer_data["comparison_label"] = baseline_label
 
     def _sanitize(record: Dict[str, object]) -> Dict[str, object]:
         cleaned: Dict[str, object] = {}
@@ -181,9 +269,7 @@ def build_map_layer(metrics: pd.DataFrame, period_key: str) -> pdk.Deck:
     for rec in layer_data.to_dict(orient="records"):
         enriched = {**rec}
         enriched["radius"] = _coerce_float(rec.get("radius"), 60.0)
-        enriched[f"{period_key}_poisson_z"] = _coerce_float(
-            rec.get(f"{period_key}_poisson_z"), 0.0
-        )
+        enriched["poisson_z_value"] = _coerce_float(rec.get(comp_cols["poisson_z"]), 0.0)
         records.append(_sanitize(enriched))
 
     scatter = pdk.Layer(
@@ -203,11 +289,12 @@ def build_map_layer(metrics: pd.DataFrame, period_key: str) -> pdk.Deck:
     )
 
     tooltip = {
-        "html": "<b>{store_name}</b><br/>"
+        "html": "<b>{store_display}</b><br/>"
         "Brand: {brand}<br/>"
         "City: {city}<br/>"
         "Current incidents: {current_display}<br/>"
-        "Δ vs prior: {change_display}<br/>"
+        "Baseline ({comparison_label}): {baseline_display}<br/>"
+        "Δ vs baseline: {delta_badge}<br/>"
         "Poisson Z: {poisson_z_display}<br/>"
         "Baseline z-score: {z_score_display}",
         "style": {"backgroundColor": "rgba(15,17,22,0.85)", "color": "white"},
@@ -230,43 +317,55 @@ def build_map_layer(metrics: pd.DataFrame, period_key: str) -> pdk.Deck:
     )
 
 
-def render_kpis(aggregated: Dict[str, float], period: PeriodDefinition) -> None:
-    cols = st.columns(3)
-    cols[0].metric(
-        f"{period.label} Incidents",
-        f"{aggregated['current']:.0f}",
-        format_delta(aggregated["change"], aggregated["pct_change"]),
-    )
-    cols[1].metric(
-        "Average Daily Volume",
-        f"{aggregated['daily_mean']:.2f}",
-        f"{aggregated['daily_change']:+.2f}",
-    )
-    risk_label = aggregated["risk_level"]
-    cols[2].metric(
-        "Risk Signal",
-        risk_label,
-        f"Anomaly score: {aggregated['z_score']:.2f}",
-    )
+def render_kpis(metrics: pd.DataFrame, comparison_mode: str) -> None:
+    comparison_label = COMPARISON_LABELS.get(comparison_mode, "Prior period")
+    cols = st.columns(len(PERIODS))
+    for col, period in zip(cols, PERIODS):
+        summary = aggregate_period(metrics, period.key, comparison_mode)
+        with col:
+            st.metric(
+                f"{period.label} Incidents",
+                f"{summary['current']:.0f}",
+                format_delta(summary["change"], summary["pct_change"]),
+            )
+            st.caption(
+                f"{comparison_label}: {summary['baseline']:.0f}"
+            )
+            st.caption(
+                f"Daily avg {summary['daily_mean']:.2f} (Δ {summary['daily_change']:+.2f})"
+            )
+            st.markdown(
+                f"**Risk:** {summary['risk_level']} (z̄ {summary['z_score']:.2f})"
+            )
 
 
-def aggregate_period(metrics: pd.DataFrame, period_key: str) -> Dict[str, float]:
+def aggregate_period(
+    metrics: pd.DataFrame,
+    period_key: str,
+    comparison_mode: str,
+) -> Dict[str, float]:
     if metrics.empty:
         return {
             "current": 0.0,
-            "previous": 0.0,
+            "baseline": 0.0,
             "change": 0.0,
             "pct_change": 0.0,
             "daily_mean": 0.0,
             "daily_change": 0.0,
             "z_score": 0.0,
             "risk_level": "Stable",
+            "baseline_label": COMPARISON_LABELS.get(comparison_mode, "Prior period"),
         }
 
+    comp_cols = get_comparison_columns(period_key, comparison_mode)
     current = metrics[f"{period_key}_current"].sum()
-    previous = metrics[f"{period_key}_previous"].sum()
-    change = current - previous
-    pct_change = (change / previous * 100) if previous > 0 else (100 if current > 0 else 0)
+    baseline_total = metrics[comp_cols["baseline"]].sum()
+    change = current - baseline_total
+    pct_change = (
+        (change / baseline_total * 100)
+        if baseline_total > 0
+        else (100 if current > 0 else 0)
+    )
 
     window_str = metrics[f"{period_key}_window"].iloc[0]
     start_str, end_str = window_str.split(" – ")
@@ -289,13 +388,14 @@ def aggregate_period(metrics: pd.DataFrame, period_key: str) -> Dict[str, float]
 
     return {
         "current": current,
-        "previous": previous,
+        "baseline": baseline_total,
         "change": change,
         "pct_change": pct_change,
         "daily_mean": daily_mean,
         "daily_change": daily_change,
         "z_score": z_mean,
         "risk_level": risk,
+        "baseline_label": COMPARISON_LABELS.get(comparison_mode, "Prior period"),
     }
 
 
@@ -303,16 +403,18 @@ def build_metrics_table(
     metrics: pd.DataFrame,
     stores: pd.DataFrame,
     period_key: str,
+    comparison_mode: str,
 ) -> pd.DataFrame:
+    comp_cols = get_comparison_columns(period_key, comparison_mode)
     display_cols = [
         "store_id",
         "brand",
         "city",
         f"{period_key}_current",
-        f"{period_key}_previous",
-        f"{period_key}_change",
-        f"{period_key}_pct_change",
-        f"{period_key}_poisson_z",
+        comp_cols["baseline"],
+        comp_cols["change"],
+        comp_cols["pct_change"],
+        comp_cols["poisson_z"],
     ]
     optional_cols = []
     for candidate in ["street_address"]:
@@ -326,10 +428,10 @@ def build_metrics_table(
         "brand": "Brand",
         "city": "City",
         f"{period_key}_current": "Current",
-        f"{period_key}_previous": "Previous",
-        f"{period_key}_change": "Δ",
-        f"{period_key}_pct_change": "%Δ",
-        f"{period_key}_poisson_z": "Poisson Z",
+        comp_cols["baseline"]: COMPARISON_LABELS.get(comparison_mode, "Baseline"),
+        comp_cols["change"]: "Δ",
+        comp_cols["pct_change"]: "%Δ",
+        comp_cols["poisson_z"]: "Poisson Z",
         "street_address": "Street Address",
     }
     rename_map = {k: v for k, v in rename_map.items() if k in table.columns}
@@ -417,15 +519,28 @@ def main():
         offenses["nibrs_crime_category"].unique()
     )
 
+    comparison_options = [
+        COMPARISON_LABELS["prior_period"],
+        COMPARISON_LABELS["prior_year"],
+    ]
+
     with st.sidebar:
         st.header("Control Panel")
+        comparison_selection = st.radio(
+            "Comparison baseline",
+            comparison_options,
+            index=0,
+            help="Switch the executive summary between prior-period and prior-year baselines.",
+        )
+        comparison_mode = normalize_comparison_mode(comparison_selection)
+
         selected_period_label = st.radio(
-            "Focus period",
+            "Focus period (table & deep dive)",
             list(period_labels.keys()),
             index=0,
-            help="Determines which CompStat window drives the KPIs and map colors.",
+            help="Drives the store table ordering and deep-dive metrics.",
         )
-        period_key = period_labels[selected_period_label]
+        focus_period_key = period_labels[selected_period_label]
 
         selected_brands = st.multiselect(
             "Retailers",
@@ -458,27 +573,12 @@ def main():
         st.warning("No offenses match the selected filters. Adjust the controls to view data.")
         return
 
-    filtered_views = build_time_series_views(filtered_offenses)
-    metrics = compute_compstat_summary(filtered_offenses, reference_date, stores)
-    store_merge_cols = ["store_id"]
-    for candidate in ["brand", "city", "latitude", "longitude", "street_address"]:
-        if candidate in stores.columns:
-            store_merge_cols.append(candidate)
-    metrics = metrics.merge(
-        stores[store_merge_cols],
-        on="store_id",
-        how="left",
-    )
-    if "brand" not in metrics.columns and "store_brand" in metrics.columns:
-        metrics["brand"] = metrics["store_brand"]
-    if "city" not in metrics.columns and "store_city" in metrics.columns:
-        metrics["city"] = metrics["store_city"]
-    if "street_address" not in metrics.columns:
-        metrics["street_address"] = ""
-    metrics = metrics.sort_values(f"{period_key}_z_score", ascending=False)
+    metrics = compute_metrics_frame(filtered_offenses, stores, reference_date).copy()
+    filtered_views = build_filtered_views_cached(filtered_offenses)
+    metrics = metrics.sort_values(f"{focus_period_key}_z_score", ascending=False)
 
-    overview_tab, viz_tab = st.tabs(
-        ["Executive Overview", "Store Visualizations"]
+    overview_tab, viz_tab, validation_tab, about_tab = st.tabs(
+        ["Executive Overview", "Store Visualizations", "Data Validation", "About the Data"]
     )
 
     with overview_tab:
@@ -488,12 +588,21 @@ def main():
             "across Dallas–Fort Worth."
         )
 
-        aggregate = aggregate_period(metrics, period_key)
-        render_kpis(aggregate, next(p for p in PERIODS if p.key == period_key))
+        st.markdown("### Multi-Window Snapshot")
+        render_kpis(metrics, comparison_mode)
 
-        map_deck = build_map_layer(metrics, period_key)
         map_col, list_col = st.columns([3, 1])
         with map_col:
+            st.markdown("#### Hotspot Map")
+            map_period_label = st.radio(
+                "Map period",
+                list(period_labels.keys()),
+                index=list(period_labels.keys()).index(selected_period_label),
+                horizontal=True,
+                key="map_period_selector",
+            )
+            map_period_key = period_labels[map_period_label]
+            map_deck = build_map_layer(metrics, map_period_key, comparison_mode)
             st.pydeck_chart(map_deck, use_container_width=True)
             legend_html = """
             <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:8px;">
@@ -516,43 +625,29 @@ def main():
             """
             st.markdown(legend_html, unsafe_allow_html=True)
             st.caption(
-                "Tip: hover a store to see current incidents, change vs prior window, the Wheeler Poisson Z-score, and the baseline anomaly z-score."
+                f"Tip: hover a store to see current incidents, change vs {COMPARISON_LABELS[comparison_mode].lower()}, the Wheeler Poisson Z-score, and the baseline anomaly z-score."
             )
         with list_col:
-            st.markdown("#### Priority Stores")
-            priority = (
-                metrics.dropna(subset=[f"{period_key}_z_score"])
-                .sort_values(f"{period_key}_z_score", ascending=False)
-                .head(5)
-            )
-            if priority.empty:
-                st.caption("No positive anomalies for the selected filters.")
-            else:
-                for _, row in priority.iterrows():
-                    label = row["store_id"]
-                    st.metric(
-                        label,
-                        f"{row[f'{period_key}_current']:.0f}",
-                        format_delta(
-                            row[f"{period_key}_change"],
-                            row[f"{period_key}_pct_change"],
-                        ),
-                    )
+            st.write("")
 
         st.markdown("### Store CompStat Table")
-        table = build_metrics_table(metrics, stores, period_key)
-        st.dataframe(
-            table,
-            column_config={
-                "Current": st.column_config.NumberColumn(format="%.0f"),
-                "Previous": st.column_config.NumberColumn(format="%.0f"),
-                "Δ": st.column_config.NumberColumn(format="%.0f"),
-                "%Δ": st.column_config.NumberColumn(format="%.1f%%"),
-                "Poisson Z": st.column_config.NumberColumn(format="%.2f"),
-            },
-            use_container_width=True,
-            hide_index=True,
-        )
+        table_tabs = st.tabs([p.label for p in PERIODS])
+        baseline_header = COMPARISON_LABELS.get(comparison_mode, "Baseline")
+        for tab, period in zip(table_tabs, PERIODS):
+            with tab:
+                table = build_metrics_table(metrics, stores, period.key, comparison_mode)
+                st.dataframe(
+                    table,
+                    column_config={
+                        "Current": st.column_config.NumberColumn(format="%.0f"),
+                        baseline_header: st.column_config.NumberColumn(format="%.0f"),
+                        "Δ": st.column_config.NumberColumn(format="%.0f"),
+                        "%Δ": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Poisson Z": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         store_labels = (
             metrics["store_id"].astype(str)
@@ -572,19 +667,25 @@ def main():
         selected_store_id = store_lookup[selected_store_label]
         selected_row = metrics[metrics["store_id"] == selected_store_id].iloc[0]
 
+        focus_cols = get_comparison_columns(focus_period_key, comparison_mode)
         cols = st.columns(3)
         cols[0].metric(
             "Current incidents",
-            f"{selected_row[f'{period_key}_current']:.0f}",
+            f"{selected_row[f'{focus_period_key}_current']:.0f}",
             format_delta(
-                selected_row[f"{period_key}_change"],
-                selected_row[f"{period_key}_pct_change"],
+                selected_row[focus_cols["change"]],
+                selected_row[focus_cols["pct_change"]],
             ),
         )
-        z_val = selected_row.get(f"{period_key}_z_score") or 0
+        z_val = selected_row.get(f"{focus_period_key}_z_score") or 0
         cols[1].metric("Z-Score", f"{z_val:.2f}")
-        p_val = selected_row.get(f"{period_key}_poisson_p") or 1
-        cols[2].metric("Poisson Trigger", f"{p_val:.3f}")
+        poisson_z_val = selected_row.get(focus_cols["poisson_z"]) or 0
+        cols[2].metric(
+            f"{COMPARISON_LABELS[comparison_mode]} Poisson Z",
+            f"{poisson_z_val:+.2f}",
+        )
+        p_val = selected_row.get(f"{focus_period_key}_poisson_p") or 1
+        cols[2].caption(f"Poisson p-value: {p_val:.3f}")
 
         charts_col1, charts_col2 = st.columns(2)
         with charts_col1:
@@ -608,7 +709,7 @@ def main():
             )
 
         st.markdown("#### Tactical Notes")
-        for note in derive_action_items(selected_row, period_key):
+        for note in derive_action_items(selected_row, focus_period_key, comparison_mode):
             st.write(f"- {note}")
 
         st.markdown("#### Strategic Considerations")
@@ -718,8 +819,157 @@ def main():
                     use_container_width=True,
                     key=f"compare-heatmap-{store_id}",
                 )
-
                 st.divider()
+
+    with validation_tab:
+        st.header("Data Validation & Spot Checks")
+        total_filtered_incidents = int(filtered_offenses.shape[0])
+        total_unique_stores = filtered_offenses["store_id"].nunique()
+        min_date = pd.to_datetime(filtered_offenses["occurred_date"]).min()
+        max_date = pd.to_datetime(filtered_offenses["occurred_date"]).max()
+        validation_metrics = st.columns(4)
+        validation_metrics[0].metric("Filtered Incidents", f"{total_filtered_incidents:,}")
+        validation_metrics[1].metric("Stores in Scope", f"{total_unique_stores}")
+        validation_metrics[2].metric(
+            "First Incident",
+            min_date.strftime("%Y-%m-%d") if pd.notna(min_date) else "n/a",
+        )
+        validation_metrics[3].metric(
+            "Last Incident",
+            max_date.strftime("%Y-%m-%d") if pd.notna(max_date) else "n/a",
+        )
+
+        run_validation = st.checkbox(
+            "Run detailed validation summaries",
+            value=False,
+            help="Enable to materialize baseline comparisons, null checks, and store spot checks.",
+        )
+
+        if not run_validation:
+            st.info("Enable the checkbox above to compute validation summaries.")
+        else:
+            st.markdown("### Period Totals vs Baselines")
+            summary_rows: List[Dict[str, object]] = []
+            for period in PERIODS:
+                aggregate = aggregate_period(metrics, period.key, comparison_mode)
+                summary_rows.append(
+                    {
+                        "Period": period.label,
+                        "Current": aggregate["current"],
+                        COMPARISON_LABELS.get(comparison_mode, "Baseline"): aggregate["baseline"],
+                        "Δ": aggregate["change"],
+                        "%Δ": aggregate["pct_change"],
+                        "Avg Daily": aggregate["daily_mean"],
+                        "Risk": aggregate["risk_level"],
+                    }
+                )
+            summary_df = pd.DataFrame(summary_rows)
+            st.dataframe(
+                summary_df,
+                column_config={
+                    "Current": st.column_config.NumberColumn(format="%.0f"),
+                    COMPARISON_LABELS.get(comparison_mode, "Baseline"): st.column_config.NumberColumn(
+                        format="%.0f"
+                    ),
+                    "Δ": st.column_config.NumberColumn(format="%.0f"),
+                    "%Δ": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Avg Daily": st.column_config.NumberColumn(format="%.2f"),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            st.markdown("### Null & Geometry Checks")
+            missing_geo = metrics[metrics[["latitude", "longitude"]].isna().any(axis=1)][
+                ["store_id", "brand", "city"]
+            ]
+            if missing_geo.empty:
+                st.success("All mapped stores have latitude and longitude values.")
+            else:
+                st.warning("Some stores are missing geometry; they will be excluded from the map.")
+                st.dataframe(missing_geo, hide_index=True)
+
+            critical_columns = [
+                "store_id",
+                "store_brand",
+                "occurred_date",
+                "nibrs_crime_category",
+            ]
+            null_report = (
+                filtered_offenses[critical_columns]
+                .isna()
+                .mean()
+                .rename("Null Rate")
+                .mul(100)
+                .reset_index()
+                .rename(columns={"index": "Column"})
+            )
+            st.dataframe(
+                null_report,
+                column_config={"Null Rate": st.column_config.NumberColumn(format="%.2f%%")},
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            st.markdown("### Store Spot Checks")
+            focus_cols = get_comparison_columns(focus_period_key, comparison_mode)
+            spot_columns = [
+                "store_id",
+                "brand",
+                "city",
+                f"{focus_period_key}_current",
+                focus_cols["baseline"],
+                focus_cols["change"],
+                focus_cols["pct_change"],
+                f"{focus_period_key}_z_score",
+            ]
+            spot_frame = metrics[spot_columns].head(10)
+            st.dataframe(
+                spot_frame,
+                column_config={
+                    f"{focus_period_key}_current": st.column_config.NumberColumn(format="%.0f"),
+                    focus_cols["baseline"]: st.column_config.NumberColumn(format="%.0f"),
+                    focus_cols["change"]: st.column_config.NumberColumn(format="%.0f"),
+                    focus_cols["pct_change"]: st.column_config.NumberColumn(format="%.1f%%"),
+                    f"{focus_period_key}_z_score": st.column_config.NumberColumn(format="%.2f"),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
+        st.caption(
+            "Spot checks list the first ten stores ordered by anomaly score for the focused period."
+        )
+
+    with about_tab:
+        st.header("About the Data")
+        st.markdown(
+            """
+            ### Sources & Attribution
+
+            - **Store locations:** Queried from [OpenStreetMap Nominatim](https://nominatim.openstreetmap.org/) for Home Depot and Lowe's sites across the Dallas–Fort Worth metro. © OpenStreetMap contributors (ODbL 1.0).
+            - **Crime data:** Dallas Police Department NIBRS incidents via the [Dallas Open Data Portal](https://www.dallasopendata.com/resource/qv6i-rri7.json). Public domain; see portal usage terms.
+
+            ### Data Pipeline
+
+            - `scripts/fetch_data.py` geocodes stores, downloads incidents, localizes timestamps, and writes:
+              - `data/home_improvement_stores.csv`
+              - `data/store_offenses.parquet`
+            - `compstat/data_loader.py` reads the curated files, applies quality checks, and derives daily/week/month fields.
+            - `compstat/metrics.py` builds rolling (7-day, 28-day) and year-to-date comparisons, including z-scores and Wheeler Poisson Z for anomaly signals.
+            - `compstat/timeseries.py` produces daily, weekly, category, and hourly views for downstream charts.
+
+            ### Refresh Cadence
+
+            - Fetch script intended for on-demand updates; respect Nominatim rate limits (≥1s between calls) and Socrata API quotas.
+            - After running the script, redeploy or restart the Streamlit session to load the refreshed files.
+
+            ### Caveats & Interpretation
+
+            - NIBRS offense data is as-published by DPD; geocoding accuracy depends on the portal’s `geocoded_column` field.
+            - Anomaly scores are store-specific: z-scores compare current counts to historical store baselines; Poisson probabilities highlight statistically rare spikes.
+            - Filter controls propagate to all visuals; use the Data Validation tab to inspect totals, null rates, and spot checks for the active slice.
+            """
+        )
 
 
 if __name__ == "__main__":

@@ -34,8 +34,8 @@ def build_time_series_views(offenses_df: pd.DataFrame) -> Dict[str, pd.DataFrame
 
     weekly_counts = (
         df.set_index("occurred_local")
-        .groupby("store_id", group_keys=False)
-        .resample("W", label="left", closed="left", include_groups=False)
+        .groupby("store_id")
+        .resample("W", label="left", closed="left")
         .size()
         .rename("count")
         .reset_index()
