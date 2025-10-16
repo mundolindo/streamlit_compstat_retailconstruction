@@ -1,6 +1,7 @@
 import math
 import time
 from datetime import datetime
+from os import getenv
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -21,6 +22,9 @@ NOMINATIM_HEADERS = {
 SOC_HEADERS = {
     "User-Agent": "streamlit-compstat-app/0.1 (+https://streamlit.io/)",
 }
+SOC_APP_TOKEN = getenv("DALLAS_OPEN_DATA_APP_TOKEN") or getenv("SOCRATA_APP_TOKEN")
+if SOC_APP_TOKEN:
+    SOC_HEADERS["X-App-Token"] = SOC_APP_TOKEN
 
 ALLOWED_COUNTIES = {
     "Dallas County",
@@ -39,6 +43,9 @@ STORE_QUERIES = [
 
 DEFAULT_RADIUS_METERS = 400  # roughly a quarter-mile catchment
 DEFAULT_START_DATE = "2024-01-01"
+SOC_PAGINATION_LIMIT = 20000
+MAX_RETRY_ATTEMPTS = 6
+BASE_RETRY_DELAY = 1.0
 
 
 def haversine_distance_meters(
@@ -57,13 +64,51 @@ def haversine_distance_meters(
     return 2 * radius * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _request_with_backoff(
+    url: str,
+    params: Dict,
+    headers: Dict,
+    max_attempts: int = MAX_RETRY_ATTEMPTS,
+) -> requests.Response:
+    attempt = 0
+    delay = BASE_RETRY_DELAY
+
+    while True:
+        attempt += 1
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=60)
+        except requests.RequestException:
+            if attempt >= max_attempts:
+                raise
+            time.sleep(delay)
+            delay *= 1.5
+            continue
+        if response.status_code in (429, 500, 502, 503, 504):
+            if attempt >= max_attempts:
+                response.raise_for_status()
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    wait_time = float(retry_after)
+                except ValueError:
+                    wait_time = delay
+            else:
+                wait_time = delay
+            time.sleep(wait_time)
+            delay *= 1.5
+            continue
+
+        response.raise_for_status()
+        return response
+
+
 def fetch_store_candidates() -> List[Dict]:
     """Fetch store candidates from Nominatim and filter to the DFW area."""
     results: List[Dict] = []
     seen_positions: set[Tuple[str, str]] = set()
 
     for config in STORE_QUERIES:
-        response = requests.get(
+        response = _request_with_backoff(
             NOMINATIM_URL,
             params={
                 "format": "json",
@@ -72,9 +117,7 @@ def fetch_store_candidates() -> List[Dict]:
                 "q": config["query"],
             },
             headers=NOMINATIM_HEADERS,
-            timeout=30,
         )
-        response.raise_for_status()
         payload = response.json()
 
         for entry in payload:
@@ -160,83 +203,93 @@ def fetch_offenses_for_store(
     # Socrata expects ISO 8601 timestamp
     start_iso = f"{start_date}T00:00:00"
 
-    params = {
-        "$select": ",".join(
-            [
-                "incidentnum",
-                "incident_address",
-                "date1",
-                "nibrs_crime",
-                "nibrs_crime_category",
-                "nibrs_crimeagainst",
-                "nibrs_code",
-                "beat",
-                "division",
-                "sector",
-                "district",
-                "zip_code",
-                "geocoded_column",
-                "callorgdate",
-                "time1",
-                "time2",
-            ]
-        ),
-        "$where": f"within_circle(geocoded_column, {lat}, {lon}, {radius_meters}) AND date1 >= '{start_iso}'",
-        "$limit": 50000,
-    }
-
-    response = requests.get(
-        SOC_DATASET_URL,
-        params=params,
-        headers=SOC_HEADERS,
-        timeout=60,
-    )
-    response.raise_for_status()
-    records = response.json()
-
     enriched: List[Dict] = []
-    for entry in records:
-        loc = entry.get("geocoded_column") or {}
-        incident_lat = loc.get("latitude")
-        incident_lon = loc.get("longitude")
-        if not incident_lat or not incident_lon:
-            continue
+    offset = 0
 
-        try:
-            incident_lat_f = float(incident_lat)
-            incident_lon_f = float(incident_lon)
-        except ValueError:
-            continue
+    selected_columns = [
+        "incidentnum",
+        "incident_address",
+        "date1",
+        "nibrs_crime",
+        "nibrs_crime_category",
+        "nibrs_crimeagainst",
+        "nibrs_code",
+        "beat",
+        "division",
+        "sector",
+        "district",
+        "zip_code",
+        "geocoded_column",
+        "callorgdate",
+        "time1",
+        "time2",
+    ]
 
-        enriched.append(
-            {
-                "store_id": store["store_id"],
-                "store_brand": store["brand"],
-                "store_name": store["name"],
-                "store_city": store["city"],
-                "radius_meters": radius_meters,
-                "incident_number": entry.get("incidentnum"),
-                "incident_address": entry.get("incident_address"),
-                "occurred_raw": entry.get("date1"),
-                "time1_raw": entry.get("time1"),
-                "time2_raw": entry.get("time2"),
-                "call_received_raw": entry.get("callorgdate"),
-                "nibrs_crime": entry.get("nibrs_crime"),
-                "nibrs_code": entry.get("nibrs_code"),
-                "nibrs_crime_category": entry.get("nibrs_crime_category"),
-                "nibrs_crime_against": entry.get("nibrs_crimeagainst"),
-                "beat": entry.get("beat"),
-                "division": entry.get("division"),
-                "sector": entry.get("sector"),
-                "district": entry.get("district"),
-                "zip_code": entry.get("zip_code"),
-                "incident_latitude": incident_lat_f,
-                "incident_longitude": incident_lon_f,
-                "distance_meters": haversine_distance_meters(
-                    lat, lon, incident_lat_f, incident_lon_f
-                ),
-            }
-        )
+    while True:
+        params = {
+            "$select": ",".join(selected_columns),
+            "$where": (
+                f"within_circle(geocoded_column, {lat}, {lon}, {radius_meters}) "
+                f"AND date1 >= '{start_iso}'"
+            ),
+            "$limit": SOC_PAGINATION_LIMIT,
+            "$offset": offset,
+        }
+
+        response = _request_with_backoff(SOC_DATASET_URL, params=params, headers=SOC_HEADERS)
+        records = response.json()
+
+        if not records:
+            break
+
+        for entry in records:
+            loc = entry.get("geocoded_column") or {}
+            incident_lat = loc.get("latitude")
+            incident_lon = loc.get("longitude")
+            if not incident_lat or not incident_lon:
+                continue
+
+            try:
+                incident_lat_f = float(incident_lat)
+                incident_lon_f = float(incident_lon)
+            except ValueError:
+                continue
+
+            enriched.append(
+                {
+                    "store_id": store["store_id"],
+                    "store_brand": store["brand"],
+                    "store_name": store["name"],
+                    "store_city": store["city"],
+                    "radius_meters": radius_meters,
+                    "incident_number": entry.get("incidentnum"),
+                    "incident_address": entry.get("incident_address"),
+                    "occurred_raw": entry.get("date1"),
+                    "time1_raw": entry.get("time1"),
+                    "time2_raw": entry.get("time2"),
+                    "call_received_raw": entry.get("callorgdate"),
+                    "nibrs_crime": entry.get("nibrs_crime"),
+                    "nibrs_code": entry.get("nibrs_code"),
+                    "nibrs_crime_category": entry.get("nibrs_crime_category"),
+                    "nibrs_crime_against": entry.get("nibrs_crimeagainst"),
+                    "beat": entry.get("beat"),
+                    "division": entry.get("division"),
+                    "sector": entry.get("sector"),
+                    "district": entry.get("district"),
+                    "zip_code": entry.get("zip_code"),
+                    "incident_latitude": incident_lat_f,
+                    "incident_longitude": incident_lon_f,
+                    "distance_meters": haversine_distance_meters(
+                        lat, lon, incident_lat_f, incident_lon_f
+                    ),
+                }
+            )
+
+        if len(records) < SOC_PAGINATION_LIMIT:
+            break
+
+        offset += SOC_PAGINATION_LIMIT
+        time.sleep(0.25)
 
     return enriched
 
